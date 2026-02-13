@@ -13,10 +13,14 @@ class MockServer:
     - Actual sleep for realistic timing
     """
     
-    def __init__(self, host, port, cache_size=50, interference_level=0.0, max_connections=40):
+    def __init__(self, host, port, cache_size=50, interference_level=0.0, max_connections=40, speed_multiplier=1.0):
         self.host = host
         self.port = port
         self.key = f"{host}:{port}"
+        
+        # Performance Modifier (Speed)
+        # 1.0 = Normal, 0.7 = 30% Slower, 1.3 = 30% Faster
+        self.speed_multiplier = speed_multiplier
         
         # Cache (smaller = harder to maintain locality)
         self.cache = {} # key -> data
@@ -40,6 +44,10 @@ class MockServer:
         self.is_healthy = True
         self.failure_until = 0  # Timestamp when server recovers
         
+        # Dynamic Partial Failures
+        self.packet_drop_rate = 0.0 # 0% to 100%
+        self.temporary_slowdown_factor = 1.0 # 1.0 = Normal, >1.0 = Slower
+        
         # Stats
         self.stats = {
             'requests': 0,
@@ -47,9 +55,20 @@ class MockServer:
             'misses': 0,
             'timeouts': 0,
             'overloaded': 0,
-            'total_latency': 0.0
+            'total_latency': 0.0,
+            'drops': 0
         }
         self.lock = threading.Lock()
+
+    def set_speed(self, multiplier):
+        """Dynamically change server speed (e.g. for degradation simulation)"""
+        with self.lock:
+            self.speed_multiplier = multiplier
+
+    def set_packet_drop_rate(self, rate):
+        """Set probabilistic packet drop rate (0.0 - 1.0)"""
+        with self.lock:
+            self.packet_drop_rate = rate
 
     def process_request(self, key, size_kb, timeout_ms=250, simulate_sleep=True):
         """
@@ -65,7 +84,12 @@ class MockServer:
         with self.lock:
             self.stats['requests'] += 1
             
-            # 0. Check if server is healthy (temporary failures)
+            # 0. Check for packet drops (Partial Failure)
+            if self.packet_drop_rate > 0 and random.random() < self.packet_drop_rate:
+                self.stats['drops'] += 1
+                return False, 0, False, "packet_drop"
+            
+            # 0.1 Check if server is healthy (temporary failures)
             if not self.is_healthy:
                 if time.time() < self.failure_until:
                     return False, 0, False, "server_down"
@@ -73,7 +97,7 @@ class MockServer:
                     self.is_healthy = True  # Recover
             
             # Random server failures (1% chance)
-            if random.random() < 0.01:
+            if random.random() < 0.001: # Reduced to 0.1% for control
                 self.is_healthy = False
                 self.failure_until = time.time() + random.uniform(0.5, 2.0)  # Down for 0.5-2s
                 return False, 0, False, "server_failure"
@@ -135,14 +159,24 @@ class MockServer:
                 queue_delay = self.current_connections * random.uniform(2, 5)
                 latency += queue_delay
                 
-                # 6. Update Stats
+                # 6. Apply Speed Multiplier (Heterogeneous Servers)
+                # Higher speed multiplier = Lower latency (Faster)
+                # Lower speed multiplier = Higher latency (Slower)
+                # e.g. 1.3x speed => latency / 1.3
+                if self.speed_multiplier > 0:
+                     latency /= self.speed_multiplier
+                
+                # 7. Apply Temporary Slowdown (Partial Failures)
+                latency *= self.temporary_slowdown_factor
+                
+                # 8. Update Stats
                 self.stats['total_latency'] += latency
             
-            # 7. Actually sleep to simulate processing time (realistic timing)
+            # 9. Actually sleep to simulate processing time (realistic timing)
             if simulate_sleep:
                 time.sleep(latency / 1000.0)  # Convert ms to seconds
             
-            # 8. Check Timeout
+            # 10. Check Timeout
             with self.lock:
                 if latency > timeout_ms:
                     self.stats['timeouts'] += 1
@@ -177,11 +211,14 @@ class MockServer:
             self.current_connections = 0
             self.is_healthy = True
             self.failure_until = 0
+            self.packet_drop_rate = 0.0
+            self.temporary_slowdown_factor = 1.0
             self.stats = {
                 'requests': 0,
                 'hits': 0,
                 'misses': 0,
                 'timeouts': 0,
                 'overloaded': 0,
-                'total_latency': 0.0
+                'total_latency': 0.0,
+                'drops': 0
             }
