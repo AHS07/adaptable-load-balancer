@@ -261,9 +261,9 @@ class ALPHA1Strategy(Strategy):
         self.slo_threshold_ms = slo_threshold_ms  # Target SLO in milliseconds
         self.hedge_threshold_multiplier = hedge_threshold_multiplier  # When to hedge
         
-        # Adaptive weights for tail-risk scoring
-        self.beta = 0.3   # Weight for interference signal
-        self.gamma = 0.4  # Weight for head request age
+        # Adaptive weights for tail-risk scoring (reduced to prevent over-sensitivity)
+        self.beta = 0.2   # Weight for interference signal (reduced from 0.3)
+        self.gamma = 0.3  # Weight for head request age (reduced from 0.4)
         
         # EWMA smoothing factor (0.3 = 30% new, 70% old)
         self.ewma_alpha = 0.3
@@ -371,8 +371,9 @@ class ALPHA1Strategy(Strategy):
         current_time = time.time()
         
         # Update work queue EWMA based on current connections
-        # Higher connections = more work in queue
-        current_work = server['connections'] * 10  # Arbitrary work units
+        # Use a normalized metric to avoid self-referential feedback
+        # Normalize by total pool size to make it relative
+        current_work = server['connections']  # Use raw connections, not amplified
         state['work_queue_ewma'] = (
             self.ewma_alpha * current_work + 
             (1 - self.ewma_alpha) * state['work_queue_ewma']
@@ -386,20 +387,22 @@ class ALPHA1Strategy(Strategy):
             times = list(state['response_times'])
             avg_time = sum(times) / len(times)
             variance = sum((x - avg_time) ** 2 for x in times) / len(times)
-            # Normalize variance to 0-10 scale (variance in ms², divide by 1000 for scaling)
-            state['interference_signal'] = min(variance / 1000.0, 10.0)  # Cap at 10
+            # Normalize variance to 0-1 scale for better weight balance
+            state['interference_signal'] = min(variance / 10000.0, 1.0)  # Cap at 1.0
         else:
-            # Not enough response time data yet, use neutral interference
-            state['interference_signal'] = 0.0
+            # Not enough response time data yet, use small neutral value (not zero)
+            # This prevents cold-start bias where new servers look artificially safe
+            state['interference_signal'] = 0.1
         
-        # Update head request age (time since oldest request)
+        # Fix head request age: only track if there's actual queue buildup
+        # Reset more aggressively to avoid accumulation
         time_since_last = current_time - state['last_update']
-        if server['connections'] > 0:
-            # If there are connections, age increases
-            state['head_request_age'] = min(state['head_request_age'] + time_since_last, 5.0)
+        if server['connections'] > 2:  # Only accumulate if there's actual queueing
+            # Age increases proportional to queue depth
+            state['head_request_age'] = min(state['head_request_age'] + (time_since_last * server['connections'] / 10.0), 1.0)
         else:
-            # If queue is empty, reset age
-            state['head_request_age'] = 0.0
+            # Decay age when queue is small
+            state['head_request_age'] = max(state['head_request_age'] * 0.5, 0.0)
         
         state['last_update'] = current_time
     
@@ -417,15 +420,15 @@ class ALPHA1Strategy(Strategy):
         p99_index = int(len(sorted_latencies) * 0.99)
         current_p99 = sorted_latencies[p99_index] if p99_index < len(sorted_latencies) else sorted_latencies[-1]
         
-        # Feedback adjustment
+        # Feedback adjustment (more conservative to prevent oscillation)
         if current_p99 > self.target_p99_ms:
             # p99 is too high, increase sensitivity to interference and age
-            self.beta = min(self.beta * 1.1, 1.0)   # Increase by 10%, cap at 1.0
-            self.gamma = min(self.gamma * 1.1, 1.0)
+            self.beta = min(self.beta * 1.05, 0.5)   # Increase by 5%, cap at 0.5 (reduced from 1.0)
+            self.gamma = min(self.gamma * 1.05, 0.5)
         else:
             # p99 is good, slowly decay weights to avoid over-sensitivity
-            self.beta = max(self.beta * 0.95, 0.1)  # Decay by 5%, floor at 0.1
-            self.gamma = max(self.gamma * 0.95, 0.1)
+            self.beta = max(self.beta * 0.98, 0.1)  # Decay by 2% (slower than before), floor at 0.1
+            self.gamma = max(self.gamma * 0.98, 0.1)
     
     def record_response_time(self, host, port, response_time_seconds):
         """
@@ -561,6 +564,10 @@ class BETA1Strategy(Strategy):
     def select_server(self, server_list):
         """
         Main selection logic using BETA1 (BLCRW) algorithm
+        
+        NOTE: This method generates a pseudo-key for compatibility with the
+        standard Strategy interface. For true cache-aware routing, use
+        select_server_with_key() with actual request keys.
         """
         if not server_list:
             return None
@@ -568,58 +575,11 @@ class BETA1Strategy(Strategy):
         if len(server_list) == 1:
             return server_list[0]
         
-        with self.lock:
-            # Detect new servers (scaling event)
-            self._detect_scaling_events(server_list)
-            
-            # For cache-aware routing, we need a key
-            # Since we don't have request context here, we'll use a pseudo-key
-            # based on timestamp and request count for demonstration
-            # In a real implementation, this would come from the request
-            pseudo_key = f"req_{self.total_requests}_{int(time.time() * 1000) % 10000}"
-            
-            # Step 1: Rank servers using HRW (Rendezvous Hashing)
-            ranked_servers = self._hrw_rank(pseudo_key, server_list)
-            
-            # Step 2: Find first non-overloaded server in ranking
-            chosen_server = None
-            average_load = self._calculate_average_load(server_list)
-            
-            for server in ranked_servers:
-                server_key = f"{server['host']}:{server['port']}"
-                
-                # Check if server is overloaded
-                if self._is_overloaded(server, average_load):
-                    continue
-                
-                # Check warm-up constraints
-                if self._in_warmup_mode(server_key):
-                    if self._warmup_quota_exceeded(server_key, average_load):
-                        self.warmup_redirects += 1
-                        continue
-                
-                # Check popularity-aware selection (cache warmth)
-                if self._key_is_recent_on(pseudo_key, server_key):
-                    # Cache hit - key recently seen on this server
-                    chosen_server = server
-                    self.cache_hits += 1
-                    break
-                
-                # Server is available and not overloaded
-                chosen_server = server
-                break
-            
-            # Step 3: Fallback to top-ranked server if all are overloaded (rare)
-            if chosen_server is None:
-                chosen_server = ranked_servers[0]
-                self.bounded_load_redirects += 1
-            
-            # Update state
-            server_key = f"{chosen_server['host']}:{chosen_server['port']}"
-            self._update_server_state(server_key, pseudo_key)
-            self.total_requests += 1
-            
-            return chosen_server
+        # Generate pseudo-key for compatibility
+        # This maintains deterministic routing but without true cache affinity
+        pseudo_key = f"req_{self.total_requests}"
+        
+        return self.select_server_with_key(server_list, pseudo_key)
     
     def select_server_with_key(self, server_list, request_key):
         """
@@ -726,12 +686,27 @@ class BETA1Strategy(Strategy):
     def _warmup_quota_exceeded(self, server_key, average_load):
         """
         Check if warm-up server has exceeded its quota
-        During warm-up, server should only receive warmup_quota_factor × average_load
+        During warm-up, quota linearly ramps from 30% to 100% over warmup_duration
+        
+        Formula: current_quota = 30% + (70% × progress)
+        where progress = elapsed_time / warmup_duration
         """
         state = self.server_state[server_key]
-        warmup_quota = self.warmup_quota_factor * average_load * self.warmup_duration
         
-        return state['warmup_requests'] >= warmup_quota
+        if state['warmup_start_time'] is None:
+            return False
+        
+        elapsed = time.time() - state['warmup_start_time']
+        
+        # Calculate linear ramp: 30% -> 100% over warmup_duration
+        progress = min(elapsed / self.warmup_duration, 1.0)  # 0.0 to 1.0
+        current_quota_factor = self.warmup_quota_factor + (1.0 - self.warmup_quota_factor) * progress
+        
+        # Calculate allowed requests based on current quota
+        # quota = current_quota_factor × average_load × elapsed_time
+        allowed_requests = current_quota_factor * average_load * elapsed
+        
+        return state['warmup_requests'] >= allowed_requests
     
     def _key_is_recent_on(self, key, server_key):
         """

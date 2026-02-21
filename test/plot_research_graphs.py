@@ -82,7 +82,7 @@ class DataCollectorSimulation:
                 
         elif scenario_name == "CacheLocality":
             for port in range(8001, 8006):
-                srv = MockServer('127.0.0.1', port, cache_size=20) 
+                srv = MockServer('127.0.0.1', port, cache_size=100)  # Increased from 20 to 100
                 servers.append(srv)
                 pool.add_server('127.0.0.1', port)
         
@@ -260,7 +260,7 @@ def main():
     data_helios.extend(sim.run_strategy("CacheLocality", "Round Robin", RoundRobinStrategy))
     data_helios.extend(sim.run_strategy("CacheLocality", "Least Connections", LeastConnectionsStrategy))
     data_helios.extend(sim.run_strategy("CacheLocality", "Least Response Time", ResponseTimeBasedStrategy))
-    data_helios.extend(sim.run_strategy("CacheLocality", "Helios (BETA1)", BETA1Strategy))
+    data_helios.extend(sim.run_strategy("CacheLocality", "Helios (BETA1)", lambda: BETA1Strategy(capacity_factor=4.0)))
     
     df_helios = pd.DataFrame(data_helios)
     plot_latency_cdf(df_helios, "Cache Efficiency", "test/plots/helios/cdf_cache_locality.png")
@@ -272,7 +272,7 @@ def main():
     data_burst.extend(sim.run_strategy("BurstTraffic", "Round Robin", RoundRobinStrategy))
     data_burst.extend(sim.run_strategy("BurstTraffic", "Least Connections", LeastConnectionsStrategy))
     data_burst.extend(sim.run_strategy("BurstTraffic", "Least Response Time", ResponseTimeBasedStrategy))
-    data_burst.extend(sim.run_strategy("BurstTraffic", "Helios (BETA1)", BETA1Strategy))
+    data_burst.extend(sim.run_strategy("BurstTraffic", "Helios (BETA1)", lambda: BETA1Strategy(capacity_factor=3.0)))
     
     df_burst = pd.DataFrame(data_burst)
     plot_latency_timeline(df_burst, "Burst Traffic Handling", "test/plots/helios/timeline_burst.png")

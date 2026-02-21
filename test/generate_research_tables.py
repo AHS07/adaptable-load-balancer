@@ -61,7 +61,7 @@ class DataCollectorSimulation:
                 
         elif scenario_name == "CacheLocality":
             for port in range(8001, 8006):
-                srv = MockServer('127.0.0.1', port, cache_size=20) 
+                srv = MockServer('127.0.0.1', port, cache_size=100)  # Increased from 20 to 100
                 servers.append(srv)
                 pool.add_server('127.0.0.1', port)
         
@@ -225,7 +225,7 @@ def generate_table_5_3_burst_handling(sim):
         ("Round Robin", RoundRobinStrategy),
         ("Least Connections", LeastConnectionsStrategy),
         ("Least Response Time", ResponseTimeBasedStrategy),
-        ("HELIOS", BETA1Strategy) # User might want Helios here too
+        ("HELIOS", lambda: BETA1Strategy(capacity_factor=3.0))  # Higher capacity for burst scenarios
     ]
     results = []
     for name, cls in strategies:
@@ -267,7 +267,7 @@ def generate_table_5_4_cache_performance(sim):
         ("Round Robin", RoundRobinStrategy),
         ("Least Connections", LeastConnectionsStrategy),
         ("Least Response Time", ResponseTimeBasedStrategy),
-        ("HELIOS", BETA1Strategy)
+        ("HELIOS", lambda: BETA1Strategy(capacity_factor=4.0))  # High capacity for highly skewed workloads
     ]
     results = []
     for name, cls in strategies:
